@@ -263,6 +263,16 @@ void QuicSessionConfig::Set(
   // TODO(@jasnell): QUIC allows both IPv4 and IPv6 addresses to be
   // specified. Here we're specifying one or the other. Need to
   // determine if that's what we want or should we support both.
+  //
+  // TODO(@jasnell): Currently, this is specified as a single value
+  // that is used for all connections. In the future, it may be
+  // necessary to determine the preferred address based on the
+  // remote address. The trick, however, is that the preferred
+  // address must be selected before the QuicSession is created,
+  // before the handshake can be started. That is, it may need
+  // to be an optional callback on QuicSocket. That would incur
+  // a performance penalty so we'd really have to be sure of the
+  // utility.
   if (preferred_addr != nullptr) {
     transport_params.preferred_address_present = 1;
     switch (preferred_addr->sa_family) {
@@ -2088,7 +2098,6 @@ bool QuicSession::Receive(
     UpdateIdleTimer();
 
   SendPendingData();
-  UpdateRecoveryStats();
   Debug(this, "Successfully processed received packet");
   return true;
 }
@@ -2479,7 +2488,6 @@ int QuicSession::set_session(SSL_SESSION* session) {
 }
 
 // A client QuicSession can be migrated to a different QuicSocket instance.
-// TODO(@jasnell): This will be revisited.
 bool QuicSession::set_socket(QuicSocket* socket, bool nat_rebinding) {
   CHECK(!is_server());
   CHECK(!is_destroyed());
@@ -2491,8 +2499,6 @@ bool QuicSession::set_socket(QuicSocket* socket, bool nat_rebinding) {
     return true;
 
   Debug(this, "Migrating to %s", socket->diagnostic_name());
-
-  SendSessionScope send(this);
 
   // Ensure that we maintain a reference to keep this from being
   // destroyed while we are starting the migration.
@@ -2511,22 +2517,31 @@ bool QuicSession::set_socket(QuicSocket* socket, bool nat_rebinding) {
 
   // Step 4: Update ngtcp2
   auto local_address = socket->local_address();
-  if (nat_rebinding) {
-    ngtcp2_addr addr;
-    ngtcp2_addr_init(
-        &addr,
-        local_address.data(),
-        local_address.length(),
-        nullptr);
-    ngtcp2_conn_set_local_addr(connection(), &addr);
-  } else {
+
+  // The nat_rebinding option here should rarely, if ever
+  // be used in a real application. It is intended to serve
+  // as a way of simulating a silent local address change,
+  // such as when the NAT binding changes. Currently, Node.js
+  // does not really have an effective way of detecting that.
+  // Manual user code intervention to handle the migration
+  // to the new QuicSocket is required, which should always
+  // trigger path validation using the ngtcp2_conn_initiate_migration.
+  if (LIKELY(!nat_rebinding)) {
+    SendSessionScope send(this);
     QuicPath path(local_address, remote_address_);
-    if (ngtcp2_conn_initiate_migration(
-            connection(),
-            &path,
-            uv_hrtime()) != 0) {
-      return false;
-    }
+    return ngtcp2_conn_initiate_migration(
+        connection(),
+        &path,
+        uv_hrtime()) == 0;
+  } else {
+    ngtcp2_addr addr;
+    ngtcp2_conn_set_local_addr(
+        connection(),
+        ngtcp2_addr_init(
+            &addr,
+            local_address.data(),
+            local_address.length(),
+            nullptr));
   }
 
   return true;
@@ -2877,19 +2892,6 @@ void QuicSessionOnCertDone(const FunctionCallbackInfo<Value>& args) {
 }
 }  // namespace
 
-// Recovery stats are used to allow user code to keep track of
-// important round-trip timing statistics that are updated through
-// the lifetime of a connection. Effectively, these communicate how
-// much time (from the perspective of the local peer) is being taken
-// to exchange data reliably with the remote peer.
-// TODO(@jasnell): Revisit
-void QuicSession::UpdateRecoveryStats() {
-  ngtcp2_conn_stat stat;
-  ngtcp2_conn_get_conn_stat(connection(), &stat);
-  SetStat(&QuicSessionStats::min_rtt, stat.min_rtt);
-  SetStat(&QuicSessionStats::latest_rtt, stat.latest_rtt);
-  SetStat(&QuicSessionStats::smoothed_rtt, stat.smoothed_rtt);
-}
 
 // Data stats are used to allow user code to keep track of important
 // statistics such as amount of data in flight through the lifetime
@@ -2901,6 +2903,13 @@ void QuicSession::UpdateDataStats() {
 
   ngtcp2_conn_stat stat;
   ngtcp2_conn_get_conn_stat(connection(), &stat);
+
+  SetStat(&QuicSessionStats::latest_rtt, stat.latest_rtt);
+  SetStat(&QuicSessionStats::min_rtt, stat.min_rtt);
+  SetStat(&QuicSessionStats::smoothed_rtt, stat.smoothed_rtt);
+  SetStat(&QuicSessionStats::receive_rate, stat.recv_rate_sec);
+  SetStat(&QuicSessionStats::send_rate, stat.delivery_rate_sec);
+  SetStat(&QuicSessionStats::cwnd, stat.cwnd);
 
   state_->bytes_in_flight = stat.bytes_in_flight;
   // The max_bytes_in_flight is a highwater mark that can be used
@@ -3378,8 +3387,10 @@ int QuicSession::OnStreamReset(
 // sensitivity of PATH_CHALLENGE operations (an attacker
 // could use a compromised PATH_CHALLENGE to trick an endpoint
 // into redirecting traffic).
-// TODO(@jasnell): In the future, we'll want to explore whether
-// we want to handle the different cases of ngtcp2_rand_ctx
+//
+// The ngtcp2_rand_ctx tells us what the random data is used for.
+// Currently, there is only one use. In the future, we'll want to
+// explore whether we want to handle the different cases uses.
 int QuicSession::OnRand(
     ngtcp2_conn* conn,
     uint8_t* dest,
@@ -3669,7 +3680,7 @@ void QuicSessionSetSocket(const FunctionCallbackInfo<Value>& args) {
   ASSIGN_OR_RETURN_UNWRAP(&session, args.Holder());
   CHECK(args[0]->IsObject());
   ASSIGN_OR_RETURN_UNWRAP(&socket, args[0].As<Object>());
-  args.GetReturnValue().Set(session->set_socket(socket));
+  args.GetReturnValue().Set(session->set_socket(socket, args[1]->IsTrue()));
 }
 
 // GracefulClose flips a flag that prevents new local streams
@@ -3744,8 +3755,7 @@ void QuicSessionSilentClose(const FunctionCallbackInfo<Value>& args) {
   session->Close(QuicSessionListener::SESSION_CLOSE_FLAG_SILENT);
 }
 
-// TODO(addaleax): This is a temporary solution for testing and should be
-// removed later.
+// This is used purely for testing.
 void QuicSessionRemoveFromSocket(const FunctionCallbackInfo<Value>& args) {
   QuicSession* session;
   ASSIGN_OR_RETURN_UNWRAP(&session, args.Holder());

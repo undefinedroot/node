@@ -1246,12 +1246,16 @@ empty object when the key exchange is not ephemeral. The supported types are
 
 For example: `{ type: 'ECDH', name: 'prime256v1', size: 256 }`.
 
-#### `quicclientsession.setSocket(socket])`
+#### `quicclientsession.setSocket(socket[, natRebinding])`
 <!-- YAML
 added: REPLACEME
 -->
 
 * `socket` {QuicSocket} A `QuicSocket` instance to move this session to.
+* `natRebinding` {boolean} When `true`, indicates that the local address is to
+  be changed without triggering address validation. This will be rare and will
+  typically be used only to test resiliency in NAT rebind scenarios.
+  **Default**: `false`.
 * Returns: {Promise}
 
 Migrates the `QuicClientSession` to the given `QuicSocket` instance. If the new
@@ -1440,6 +1444,24 @@ Creates and adds a new `QuicEndpoint` to the `QuicSocket` instance. An
 error will be thrown if `quicsock.addEndpoint()` is called either after
 the `QuicSocket` has already started binding to the local ports, or after
 the `QuicSocket` has been destroyed.
+
+#### `quicsocket.blockList`
+<!-- YAML
+added: REPLACEME
+-->
+
+* Type: {net.BlockList}
+
+A {net.BlockList} instance used to define rules for remote IPv4 or IPv6
+addresses that this `QuicSocket` is not permitted to interact with. The
+rules can be specified as either specific individual addresses, ranges
+of addresses, or CIDR subnet ranges.
+
+When listening as a server, if a packet is received from a blocked address,
+the packet will be ignored.
+
+When connecting as a client, if the remote IP address is blocked, the
+connection attempt will be rejected.
 
 #### `quicsocket.bound`
 <!-- YAML

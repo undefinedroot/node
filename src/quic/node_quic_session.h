@@ -204,7 +204,10 @@ enum QuicSessionStateFields {
   V(BLOCK_COUNT, block_count, "Block Count")                                   \
   V(MIN_RTT, min_rtt, "Minimum RTT")                                           \
   V(LATEST_RTT, latest_rtt, "Latest RTT")                                      \
-  V(SMOOTHED_RTT, smoothed_rtt, "Smoothed RTT")
+  V(SMOOTHED_RTT, smoothed_rtt, "Smoothed RTT")                                \
+  V(CWND, cwnd, "Cwnd")                                                        \
+  V(RECEIVE_RATE, receive_rate, "Receive Rate / Sec")                          \
+  V(SEND_RATE, send_rate, "Send Rate  Sec")                                    \
 
 #define V(name, _, __) IDX_QUIC_SESSION_STATS_##name,
 enum QuicSessionStatsIdx : int {
@@ -616,20 +619,17 @@ class QuicApplication : public MemoryRetainer,
 
   virtual void ResumeStream(int64_t stream_id) {}
 
-  virtual void SetSessionTicketAppData(const SessionTicketAppData& app_data) {
-    // TODO(@jasnell): Different QUIC applications may wish to set some
-    // application data in the session ticket (e.g. http/3 would set
-    // server settings in the application data). For now, doing nothing
-    // as I'm just adding the basic mechanism.
-  }
+  // Different QUIC applications may set some application data in
+  // the session ticket (e.g. http/3 would set server settings in the
+  // application data). By default, there's nothing to set.
+  virtual void SetSessionTicketAppData(const SessionTicketAppData& app_data) {}
 
+  // Different QUIC applications may set some application data in
+  // the session ticket (e.g. http/3 would set server settings in the
+  // application data). By default, there's nothing to get.
   virtual SessionTicketAppData::Status GetSessionTicketAppData(
       const SessionTicketAppData& app_data,
       SessionTicketAppData::Flag flag) {
-    // TODO(@jasnell): Different QUIC application may wish to set some
-    // application data in the session ticket (e.g. http/3 would set
-    // server settings in the application data). For now, doing nothing
-    // as I'm just adding the basic mechanism.
     return flag == SessionTicketAppData::Flag::STATUS_RENEW ?
       SessionTicketAppData::Status::TICKET_USE_RENEW :
       SessionTicketAppData::Status::TICKET_USE;
@@ -1274,8 +1274,6 @@ class QuicSession final : public AsyncWrap,
       uint64_t app_error_code);
 
   bool WritePackets(const char* diagnostic_label = nullptr);
-
-  void UpdateRecoveryStats();
 
   void UpdateConnectionID(
       int type,
